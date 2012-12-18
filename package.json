@@ -1,7 +1,8 @@
 {
   "name": "sol-telnet",
+	"description": "A server side TELNET stream protocol designed for games.",
   "version": "0.0.1",
-  "description": "A server side TELNET stream protocol designed for games.",
+	"author": "Joshua Heiks <joshuaheiks@gmail.com>",
   "main": "index.js",
   "keywords": [
     "telnet",
@@ -11,5 +12,6 @@
   "repository" : {
     "type" : "git",
     "url" : "https://github.com/joshuah/sol-telnet.git"
-  } 
+  },
+	"engines": { "node": ">= 0.8.0" }
 }
