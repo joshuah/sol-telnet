@@ -1,6 +1,10 @@
-var events = require('events'),
-    util = require('util'),
-    zlib = require('zlib');
+/*
+ * sol-telnet
+ * A telnet server stream module for MUSH/MUD.
+ */
+
+var zlib = require('zlib');
+var Duplex = require('stream').Duplex;
 
 // Basic telnet commands.
 var IAC  = 255; // Marks the start of a negotiation sequence or data byte 255.
@@ -39,74 +43,53 @@ var OPT_EXOPL = 255; // Extended-Options-List RFC 861
 // MUD related telnet options
 var OPT_COMPRESS2 = 86; // Used for the MCCP2 protocol.
 
-function TelnetStream() {
-	events.EventEmitter.call(this);
-	this.__defineGetter__('readable', function() {
-    return this.stream.readable;
-  });
-  this.__defineGetter__('writable', function() {
-    return this.stream.writable;
-  });
-	var self = this;
-	// Define our vars here...
-  self.state_ = 'data'; // I track the state of the telnet protocol.
-  self.last_byte_ = ''; // I help detect broken telnet clients.
-  self.parsed_bytes = []; // I hold the bytes that have been processed.
-  self.command_ = ''; // Holds the cur negotiation type WILL|WONT|DO|DONT
-  self.commands_ = []; // Holds telnet options and negotiations that are being processed. 
-	
-	// Telnet / Mud Options
-  self.naws_ = false;
+function TelnetServerProtocolStream(options) {
+  if (!(this instanceof TelnetServerProtocolStream))
+    return new TelnetServerProtocolStream(options);
+  
+  Duplex.call(this, options);
+  
+  this._telnet = {
+    state: 'data',     // Track the state of our parser.
+    last_byte: '',     // Used for detecting broken clients.
+    parsed_bytes: [],  // Hold bytes that have been processed.
+    command: '',       // Holds the cur negotiation type WILL|WONT|DO|DONT
+    commands: [],      // Holds telnet options and negotiations that are being processed.
+    negotiated: {      // Holds the state of negotiated telnet options.
+      86: false, // mccp2
+      31: false  // naws
+    },
+    client: {width: -1, height: -1},
+    mccp2_deflate: null // zlib stream for the MCCP2 protocol.
+  }
+
 }
-util.inherits(TelnetStream, events.EventEmitter);
 
-TelnetStream.prototype.end = function (string, encoding) {
-  this.stream.end(string, encoding);
-};
+TelnetServerProtocolStream.prototype = Object.create(
+  Duplex.prototype, { constructor: { value: TelnetServerProtocolStream }});
 
-TelnetStream.prototype.setEncoding = function (encoding) {
-  this.stream.setEncoding(encoding);
-};
-
-TelnetStream.prototype.pause = function () {
-  this.stream.pause();
-};
-TelnetStream.prototype.resume = function () {
-  this.stream.resume();
-};
-TelnetStream.prototype.destroy = function () {
-  this.stream.destroy();
-};
-TelnetStream.prototype.destroySoon = function () {
-  this.stream.destroySoon();
-};
-TelnetStream.prototype.pipe = function (destination, options) {
-  util.pump(this, destination);
-  return destination;
-};
-
-// Write data out the socket.
-TelnetStream.prototype.write_ = function(data) {
-  var self = this;
-  // If data is not a buffer convert it before the write.
+TelnetServerProtocolStream.prototype._sendToConsumer = function(data) {
+  // Send data to our consumer. Data requiring IAC escapes should be
+  // sent using the .send(data) command which calls this.
+  
+  // Make sure that data is a buffer.
   if(!Buffer.isBuffer(data)) {
     data = new Buffer(data);
   }
-
+  
   /* When MCCP2 is enabled write the data using self.mccp2_deflate.write(data).
    * when we are not using MCCP2 write the data directly out the socket. */
-  if(self.mccp2_deflate) {
-     self.mccp2_deflate.write(data);
-     self.mccp2_deflate.flush();
+  if(this._telnet.mccp2_deflate) {
+     this._telnet.mccp2_deflate.write(data);
+     this._telnet.mccp2_deflate.flush();
   } else {
-     self.stream.write(data);
+    this._destination.write(data);
   }
   
 }
 
-TelnetStream.prototype.send = function(data) {
-  // This function will send data and escape any IAC characters.
-  var self = this;
+TelnetServerProtocolStream.prototype.send = function(data) {
+  // Send data to the consumer and properly escape IAC characters in the data.
   if(!Buffer.isBuffer(data)) {
     data = new Buffer(data);
   }
@@ -120,40 +103,33 @@ TelnetStream.prototype.send = function(data) {
   
   data = out_buffer;
   out_buffer = null;
-  self.write_(data);
+  this._sendToConsumer(data);
 }
 
-TelnetStream.prototype.sendLine = function(line) {
-  // Sends a line of text followed by a newline.
-  line += "\r\n";
-  var self = this;
-  self.send(line);
-}
-
-// Send a telnet command.
-TelnetStream.prototype.sendCommand = function(command, bytes) {
-  var self = this;
+TelnetServerProtocolStream.prototype.sendCommand = function(command, bytes) {
+  //
+  // Send a telnet command to the consumer.
+  //
   var out_bytes = [IAC, command];
   if(bytes instanceof Array) {
     out_bytes.push.apply(out_bytes, bytes);
   } else {
     out_bytes.push(bytes);
   }
-  self.write_(out_bytes);
+  this._sendToConsumer(out_bytes);
   out_bytes = [];  
 }
 
-TelnetStream.prototype.handleCommand = function(command, option) {
-  // This function is called by the Telnet parser when a command is detected.
-  var self = this;
+
+TelnetServerProtocolStream.prototype._handleCommand = function(command, option) {
   // Todo: Pass these commands to our negotiation map. 
   switch(command) {
     case WILL:
       switch(option) {
         case OPT_NAWS:
-          if(self.naws_ == false) {
-            self.naws_ = true;
-            self.sendCommand(DO, OPT_NAWS);
+          if(this._telnet.negotiated[OPT_NAWS] === false) {
+            this._telnet.negotiated[OPT_NAWS] = true;
+            this.sendCommand(DO, OPT_NAWS);
           } 
           break;
       }
@@ -166,10 +142,11 @@ TelnetStream.prototype.handleCommand = function(command, option) {
           /* Activate MCCP2: 
            * 1. Inform the client that we will now start compressing the output of this socket.
            * 2. Create a new zlib object and pipe it to our socket object. */
-          self.sendCommand(SB, [OPT_COMPRESS2, IAC, SE]);
-          self.mccp2_deflate = zlib.createDeflate({'level': 9});
-          self.mccp2_deflate.pipe(self.stream);
-          self.emit('MCCP2Activated');
+          this._telnet.negotiated[OPT_COMPRESS2] = true;
+          this.sendCommand(SB, [OPT_COMPRESS2, IAC, SE]);
+          this._telnet.mccp2_deflate = zlib.createDeflate({'level': 9});
+          this._telnet.mccp2_deflate.pipe(this._destination);
+          this.emit('optionMCCP2Enabled');
           break;
       }
       break;
@@ -177,57 +154,74 @@ TelnetStream.prototype.handleCommand = function(command, option) {
       break;
     default:
       // Commands that are not handled by this telnet object are passed as events.
-      self.emit('unhandledCommand', {'command':command, 'option':option});
+      this.emit('unhandledCommand', {'command':command, 'option':option});
   }
-
 }
 
-TelnetStream.prototype.handleSubNegotiation = function(option, bytes) {
+
+TelnetServerProtocolStream.prototype._handleSubNegotiation = function(option, bytes) {
   // This function is called by the Telnet parser when a subnegotiation is sent from the client.
-  var self = this;
   switch(option) {
-    case OPT_NAWS: 
+    case OPT_NAWS:
        // Handle the NAWS sub-negotiation if the client negotiated the option. 
-       if(self.naws_ == true) {
+       if(this._telnet.negotiated[OPT_NAWS] === true) {
          bytes = new Buffer(bytes); // Convert bytes into a Buffer object.
          // Get the width and height of the remote window by fetching the two 16bit integers from the buffer.
          var width = bytes.readInt16BE(0);
          var height = bytes.readInt16BE(2);
-         self.emit('windowSizeChange', width, height);
+         // Todo: Only emit an event if size changed.
+         this.emit('clientWindowChangedSize', width, height);
+         this._telnet.client.width = width;
+         this._telnet.client.height = height;
        } 
        break;
     default:
-      self.emit('unknownSubNegotiation', option, bytes);
+      this.emit('unknownSubNegotiation', option, bytes);
   }
 }
 
-TelnetStream.prototype.parseData = function(data, encoding) {	
-	// This function parses incoming bytes from the client and detects commands, negotiations and text.
-  var self = this;
+
+TelnetServerProtocolStream.prototype._read = function(size) {}
+
+TelnetServerProtocolStream.prototype.pipe = function(destination, options) {
+  // We need to save this in a useful location incase the client enables the MCCP2 protocol
+  // which has a gzip stream for the outgoing data.
+  this._destination = destination;
+  
+  // This might be a useful location for starting up our telnet negotiations.
+  this.sendCommand(DO, OPT_NAWS);
+  this.sendCommand(WILL, OPT_COMPRESS2);
+
+}
+
+TelnetServerProtocolStream.prototype._write = function(chunk, encoding, callback) {
+  
+  	// This function parses incoming bytes from the client and detects commands, negotiations and text.
   var cur_byte; // I hold the current byte that is being processed.
 
-  for(var pos=0; pos < data.length; pos++) {
+  for(var pos=0; pos < chunk.length; pos++) {
 
-    cur_byte = data[pos];
+    cur_byte = chunk[pos];
 
-    switch(self.state_) {
+    switch(this._telnet.state) {
       case 'data':
         if(cur_byte == IAC) {
-          self.state_ = 'data-escape';
-        } else if(cur_byte == CR) {
-          self.state_ = 'newline';
-        } else if(cur_byte == LF) {
+          this._telnet.state = 'data-escape';
+        } else if(cur_byte === CR) {
+          this._telnet.state = 'newline';
+        } else if(cur_byte === LF) {
           // Some clients are only sending a LF for newlines.
-          var out_data = new Buffer(self.parsed_bytes).toString();
-          self.parsed_bytes = [];
-          self.emit('lineReceived', out_data);
+          
+          var out_data = new Buffer(this._telnet.parsed_bytes).toString();
+          this._telnet.parsed_bytes = [];
+          this.emit('lineReceived', out_data);
         } else {
-          self.parsed_bytes.push(cur_byte);
+          this._telnet.parsed_bytes.push(cur_byte);
         }
         break;
 
       case 'newline':
-        self.state_ = 'data';
+        this._telnet.state = 'data';
         switch(cur_byte) {
           case NULL:
             /* A CR NULL indicates that the client wanted to send just a CR.
@@ -237,14 +231,14 @@ TelnetStream.prototype.parseData = function(data, encoding) {
              * the left margin of the next print line. RFC 854. Track the cursor position? */
            
             // Emit a lineReceived event sending all of the previously parsed bytes.
-            var out_data = new Buffer(self.parsed_bytes).toString();
-            self.parsed_bytes = []; // Erase the parsed bytes.
-            self.emit('lineReceived', out_data); 
+            var out_data = new Buffer(this._telnet.parsed_bytes).toString();
+            this._telnet.parsed_bytes = []; // Erase the parsed bytes.
+            this.emit('lineReceived', out_data); 
             break;
 
           default:
             /* The connected client may be breaking RFC 854. A CR must be followed by a LF or a NULL.*/
-						self.emit('RFC854Error', "The remote client is breaking RFC 854.");
+						//this.emit('RFC854Error', "The remote client is breaking RFC 854.");
             break;
 
         }
@@ -254,13 +248,13 @@ TelnetStream.prototype.parseData = function(data, encoding) {
         // Bytes that follow the IAC character.
         switch(cur_byte) {
           case IAC:
-            self.parsed_bytes.push(cur_byte); // The client sent an escaped IAC
+            this._telnet.parsed_bytes.push(cur_byte); // The client sent an escaped IAC
             break;
 
           // Some clients transmit IAC NOP as a keep-alive.
           case NOP:
-            self.state_ = 'data';
-            self.emit('noOperation'); // Alert the server that a keep-alive was sent.
+            this._telnet.state = 'data';
+            this.emit('noOperation'); // Alert the server that a keep-alive was sent.
             break;
 
           // Option negotiations.
@@ -268,14 +262,14 @@ TelnetStream.prototype.parseData = function(data, encoding) {
           case WONT:
           case DO:
           case DONT:
-            self.state_ = 'option-negotiation';
-            self.command_ = cur_byte;
+            this._telnet.state = 'option-negotiation';
+            this._telnet.command = cur_byte;
             break;
           
           case SB:
             // The client is starting a sub-negotiation.
-            self.state_ = 'sub-negotiation-option';
-            self.commands_ = [];
+            this._telnet.state = 'sub-negotiation-option';
+            this._telnet.commands = [];
             break;
 
           // Unhandled telnet commands.
@@ -287,37 +281,37 @@ TelnetStream.prototype.parseData = function(data, encoding) {
           case EC:
           case EL:
           case GA:
-            self.state_ = 'data';
+            this._telnet.state = 'data';
             break;
 
           default:
             // Anything we might not expect...
-						self.state_ = 'data';  
+						this._telnet.state = 'data';  
         }
         break;
       case 'option-negotiation':
         // Todo: Check for IAC as the option and handle RFC861 here?
         // IAC [WILL|WONT|DO|DONT] OPTION
-        self.state_ = 'data';
-        var out_command = self.command_;
-        self.command_ = '';
-        self.handleCommand(out_command, cur_byte);
+        this._telnet.state = 'data';
+        var out_command = this._telnet.command;
+        this._telnet.command = '';
+        this._handleCommand(out_command, cur_byte);
         break;
 
       case 'sub-negotiation-option':
         // The cur_byte should be our telnet option.
-        self.state_ = 'sub-negotiation';
-        self.command_ = cur_byte;
+        this._telnet.state = 'sub-negotiation';
+        this._telnet.command = cur_byte;
         break;
 
       case 'sub-negotiation':
         switch(cur_byte) {
            case IAC:
-             self.state_ = 'sub-negotiation-escape';
-             self.last_byte_ = cur_byte;
+             this._telnet.state = 'sub-negotiation-escape';
+             this._telnet.last_byte = cur_byte;
              break;
            default:
-             self.commands_.push(cur_byte);
+             this._telnet.commands.push(cur_byte);
         }
         break;
 
@@ -325,63 +319,34 @@ TelnetStream.prototype.parseData = function(data, encoding) {
         switch (cur_byte) {
           case IAC:
             // The client properly escaped their IAC in the sub-negotiation.
-            self.state_ = 'sub-negotiation';
-            self.commands_.push(cur_byte);
+            this._telnet.state = 'sub-negotiation';
+            this._telnet.commands.push(cur_byte);
             break;
 
           case SE:
             // We should be done with the sub-negotiation now.
-            self.state_ = 'data';
-            var out_option = self.command_;
-            var out_bytes = self.commands_;
-						self.command_ = '';
-            self.commands_ = [];
-            self.handleSubNegotiation(out_option, out_bytes);
+            this._telnet.state = 'data';
+            var out_option = this._telnet.command;
+            var out_bytes = this._telnet.commands;
+						this._telnet.command = '';
+            this._telnet.commands = [];
+            this._handleSubNegotiation(out_option, out_bytes);
             break;
 
           default:
-            if(self.last_byte_ == IAC) {
+            if(this._telnet.last_byte === IAC) {
               // Detect if the telnet client did not properly escape their IAC character inside the sub-negotiation.
-              self.last_byte_ = '';
-              self.commands_.push(IAC);  // Append the missing data-byte 255 to the commands list. 
+              this._telnet.last_byte = '';
+              this._telnet.commands.push(IAC);  // Append the missing data-byte 255 to the commands list. 
             }
-            self.state_ = 'sub-negotiation';
-            self.commands_.push(cur_byte);
+            this._telnet.state = 'sub-negotiation';
+            this._telnet.commands.push(cur_byte);
         }
         break;
-
     }
-
   }
-	
-	
+  callback();
 }
 
-TelnetStream.prototype.attachStream = function(sock, callback) {
-	var self = this;
-	this.stream = sock;
-	this.stream.on('data', function(data, encoding) {
-		self.parseData(data, encoding);
-	});
-	
-	// Pass socket events back to the server.
-  self.stream.on('end', function() { self.emit('end'); });
-  self.stream.on('error', function(exception) { self.emit('error', exception); });
-	callback();
-}
-
-function TelnetStreamHelper(sock, callback) {
-	var ts = new TelnetStream();
-	ts.attachStream(sock, function(){
-		// For now I will pass telnet negotiation here.
-    // Negotiate NAWS / RFC 1073
-    ts.sendCommand(DO, OPT_NAWS); 
-
-    // Negotiate MCCP2 (Mud Client Compression Protocol version 2)
-    ts.sendCommand(WILL, OPT_COMPRESS2);
-		callback(ts);
-	});
-}
-
-exports.TelnetStream = TelnetStreamHelper;
+module.exports = TelnetServerProtocolStream;
 
